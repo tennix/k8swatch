@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8swatch-config
+data:
+  k8swatch-config.yml: |
+    kinds:
+      - pod
+      - service
+      - deployment
+      - replicaset
+      - statefulset
+      - daemonset
+      - secret
+      - pod
+      - service
+    types:
+      - normal
+      - warning
+    reasons:
+      - FailedSync
+      - Started

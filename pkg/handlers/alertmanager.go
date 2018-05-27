@@ -5,25 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-
-	"github.com/wyatt88/k8swatch/pkg/event"
-	kbEvent "github.com/wyatt88/k8swatch/pkg/event"
+	"strings"
 
 	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
 )
 
 const (
-	alertPushEndpoint = "/api/v1/alerts"
-	contentTypeJSON   = "application/json"
+	alertPath   = "/api/v1/alerts"
+	contentType = "application/json"
 )
 
-var alertLevel = map[string]string{
-	"Scheduled": "warning",
-	"Killing":   "firing",
-	"Started":   "good",
-}
-
-// Alert is ok
 type Alert struct {
 	Labels       map[string]string `json:"labels"`
 	Annotations  map[string]string `json:"annotations"`
@@ -36,69 +28,105 @@ type Alerts []Alert
 
 // AlertManager is the underlying struct used by the alert manager handler receivers
 type AlertManager struct {
-	url string
+	endpoint      string
+	kindFilters   map[string]struct{}
+	typeFilters   map[string]struct{}
+	reasonFilters map[string]struct{}
 }
 
-var alertManagerErrMsg = `
- %s
- 
- You need to set alertmanager url for alert manager notify,
- using "--alertmanager http://yourserverip:9093":
- `
+type Config struct {
+	Kinds   []string `json:"kinds" yaml:"kinds"`
+	Types   []string `json:"types" yaml:"types"`
+	Reasons []string `json:"reasons" yaml:"reasons"`
+}
 
-// Init is new returns a alert manager handler interface
-func (a *AlertManager) Init(alertManagerURL string) error {
-	a.url = alertManagerURL
-	if a.url == "" {
-		return fmt.Errorf(alertManagerErrMsg, "Missing alertmanager url")
+func New(alertmanagerURL string, config Config) AlertManager {
+	endpoint := alertmanagerURL + alertPath
+	kf := map[string]struct{}{}
+	tf := map[string]struct{}{}
+	rf := map[string]struct{}{}
+	for _, k := range config.Kinds {
+		kf[strings.ToLower(k)] = struct{}{}
 	}
-	return nil
+	for _, t := range config.Types {
+		tf[strings.ToLower(t)] = struct{}{}
+	}
+	for _, r := range config.Reasons {
+		rf[strings.ToLower(r)] = struct{}{}
+	}
+	return AlertManager{
+		endpoint:      endpoint,
+		kindFilters:   kf,
+		typeFilters:   tf,
+		reasonFilters: rf,
+	}
 }
 
-// ObjectCreated is ok
 func (a *AlertManager) ObjectCreated(obj interface{}) {
-	e := kbEvent.New(obj)
-	if e.Kind == "Pod" {
-		if alertLevel[e.Reason] != "" {
-			alerts := prepareMsg(e)
-			a.fire(alerts)
-		}
+	event, ok := obj.(*v1.Event)
+	if !ok {
+		glog.V(2).Infof("object %v is not a *v1.Event", obj)
+		return
 	}
+	kind := strings.ToLower(event.InvolvedObject.Kind)
+	typ := strings.ToLower(event.Type)
+	reason := strings.ToLower(event.Reason)
+	ok1 := len(a.kindFilters) == 0 // if no kind filters, all kinds matched
+	if !ok1 {
+		_, ok1 = a.kindFilters[kind]
+	}
+	ok2 := len(a.typeFilters) == 0 // if no type filters, all types matched
+	if !ok2 {
+		_, ok2 = a.typeFilters[typ]
+	}
+	ok3 := len(a.reasonFilters) == 0 // if no reason filters, all reasons matched
+	if !ok3 {
+		_, ok3 = a.reasonFilters[reason]
+	}
+
+	if !ok1 && !ok2 && !ok3 {
+		glog.Infof("event %v ignored to send alert", event)
+		return
+	}
+	alertName := fmt.Sprintf("%s %s", event.InvolvedObject.Kind, event.Reason)
+	labels := map[string]string{
+		"alertname":               alertName,
+		"namespace":               event.Namespace,
+		"name":                    event.Name,
+		"component":               event.Source.Component,
+		"host":                    event.Source.Host,
+		"reason":                  event.Reason,
+		"kind":                    event.InvolvedObject.Kind,
+		"message":                 event.Message,
+		"client":                  "k8swatch",
+		"level":                   event.Type,
+		"involvedObjectNamespace": event.InvolvedObject.Namespace,
+		"involvedObjectName":      event.InvolvedObject.Name,
+		"fieldPath":               event.InvolvedObject.FieldPath,
+	}
+	alerts := Alerts{
+		Alert{Labels: labels},
+	}
+	if err := a.fire(alerts); err != nil {
+		glog.Errorf("failed to send alert %v to %s", alerts, a.endpoint)
+		return
+	}
+	glog.Infof("Successfully send alert: %v", alerts)
 }
 
-func (a *AlertManager) fire(alerts Alerts) {
-	url := a.url + alertPushEndpoint
-	jsonBytes, err := json.Marshal(alerts)
+func (a *AlertManager) fire(alerts Alerts) error {
+	data, err := json.Marshal(alerts)
 	if err != nil {
-		glog.Errorf("failed to marshal alerts %v to json: %v", alerts, err)
-		return
+		return err
 	}
 
-	resp, err := http.Post(url, contentTypeJSON, bytes.NewBuffer(jsonBytes))
+	resp, err := http.Post(a.endpoint, contentType, bytes.NewBuffer(data))
 	if err != nil {
-		glog.Errorf("failed to post alerts to alertmanager: %v", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		glog.Errorf("Non 200 HTTP response received - %v - %v", resp.StatusCode, resp.Status)
-		return
+		return fmt.Errorf("fire response %v", resp.Status)
 	}
-	glog.Infof("Message was successfully sent to alertmanager (%s)", url)
-}
-
-func prepareMsg(e *event.Event) Alerts {
-	labels := map[string]string{
-		"namespace":  e.Namespace,
-		"name":       e.Name,
-		"reason":     e.Reason,
-		"kind":       e.Kind,
-		"message":    e.Message,
-		"client":     "k8swatch",
-		"alertstate": alertLevel[e.Reason],
-	}
-	glog.V(3).Info(e.Reason)
-	return Alerts{
-		Alert{Labels: labels},
-	}
+	return nil
 }

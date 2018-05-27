@@ -8,8 +8,7 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	"github.com/wyatt88/k8swatch/pkg/handlers"
-	"github.com/wyatt88/k8swatch/pkg/utils"
+	"github.com/tennix/k8swatch/pkg/handlers"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -19,26 +18,16 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
-// Controller is Ok
 type Controller struct {
-	clientset    kubernetes.Interface
+	kubeCli      kubernetes.Interface
 	indexer      cache.Indexer
 	queue        workqueue.RateLimitingInterface
 	informer     cache.Controller
 	eventHandler handlers.AlertManager
 }
 
-// Start is Ok
-func Start(kubeConfig string, master string, eventHandler handlers.AlertManager) {
-	var kubeClient kubernetes.Interface
-	if _, err := os.Stat(kubeConfig); os.IsNotExist(err) {
-		glog.Error("Kubeconfig file doesn't exist")
-		kubeClient = utils.GetClient()
-	} else {
-		kubeClient = utils.GetClientOutOfCluster(kubeConfig, master)
-	}
-
-	c := newController(kubeClient, eventHandler)
+func Start(kubeCli kubernetes.Interface, handler handlers.AlertManager) {
+	c := New(kubeCli, handler)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	go c.Run(stopCh)
@@ -46,11 +35,10 @@ func Start(kubeConfig string, master string, eventHandler handlers.AlertManager)
 	signal.Notify(sigterm, syscall.SIGTERM)
 	signal.Notify(sigterm, syscall.SIGINT)
 	<-sigterm
-
 }
 
-func newController(client kubernetes.Interface, eventHandler handlers.AlertManager) *Controller {
-	eventListWatcher := cache.NewListWatchFromClient(client.CoreV1().RESTClient(), "events", v1.NamespaceAll, fields.Everything())
+func New(cli kubernetes.Interface, handler handlers.AlertManager) *Controller {
+	eventListWatcher := cache.NewListWatchFromClient(cli.CoreV1().RESTClient(), "events", v1.NamespaceAll, fields.Everything())
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	indexer, informer := cache.NewIndexerInformer(eventListWatcher, &v1.Event{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -73,15 +61,14 @@ func newController(client kubernetes.Interface, eventHandler handlers.AlertManag
 		},
 	}, cache.Indexers{})
 	return &Controller{
-		clientset:    client,
+		kubeCli:      cli,
 		informer:     informer,
 		queue:        queue,
-		eventHandler: eventHandler,
+		eventHandler: handler,
 		indexer:      indexer,
 	}
 }
 
-// Run is ok
 func (c *Controller) Run(stopCh <-chan struct{}) {
 	defer runtime.HandleCrash()
 	defer c.queue.ShutDown()
@@ -112,34 +99,29 @@ func (c *Controller) processNextItem() bool {
 	}
 	defer c.queue.Done(key)
 	err := c.processItem(key.(string))
-	c.handleErr(err, key)
+	if err == nil {
+		c.queue.Forget(key)
+	} else if c.queue.NumRequeues(key) < 5 {
+		glog.Errorf("Error processing %s (will retry): %v", key, err)
+		c.queue.AddRateLimited(key)
+	} else {
+		glog.Errorf("Error processing %s (give up): %v", key, err)
+		c.queue.Forget(key)
+		runtime.HandleError(err)
+	}
 	return true
 }
 
 func (c *Controller) processItem(key string) error {
 	obj, exists, err := c.indexer.GetByKey(key)
 	if err != nil {
-		glog.Errorf("Fetching obj with key %s failed with %v", key, err)
+		glog.Errorf("Fetching obj with key %s failed: %v", key, err)
 		return err
 	}
 	if !exists {
 		glog.Infof("Event %s does not exist anymore", key)
+		return nil
 	}
 	c.eventHandler.ObjectCreated(obj)
 	return nil
-}
-
-func (c *Controller) handleErr(err error, key interface{}) {
-	if err == nil {
-		c.queue.Forget(key)
-		return
-	} else if c.queue.NumRequeues(key) < 5 {
-		glog.Infof("Error syncing pod %v: %v", key, err)
-		c.queue.AddRateLimited(key)
-		return
-	} else {
-		c.queue.Forget(key)
-		runtime.HandleError(err)
-		glog.Infof("Dropping pod %q out of the queue: %v", key, err)
-	}
 }
